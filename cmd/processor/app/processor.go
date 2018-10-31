@@ -24,20 +24,24 @@ import (
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/processor"
 	"github.com/nuclio/nuclio/pkg/processor/config"
+
 	// load all data bindings
 	_ "github.com/nuclio/nuclio/pkg/processor/databinding/eventhub"
 	_ "github.com/nuclio/nuclio/pkg/processor/databinding/v3io"
 	"github.com/nuclio/nuclio/pkg/processor/healthcheck"
 	"github.com/nuclio/nuclio/pkg/processor/loggersink"
+
 	// load all logger sinks
 	_ "github.com/nuclio/nuclio/pkg/processor/loggersink/appinsights"
 	_ "github.com/nuclio/nuclio/pkg/processor/loggersink/stdout"
 	"github.com/nuclio/nuclio/pkg/processor/metricsink"
+
 	// load all metric sinks
 	_ "github.com/nuclio/nuclio/pkg/processor/metricsink/appinsights"
 	_ "github.com/nuclio/nuclio/pkg/processor/metricsink/prometheus/pull"
 	_ "github.com/nuclio/nuclio/pkg/processor/metricsink/prometheus/push"
 	"github.com/nuclio/nuclio/pkg/processor/runtime"
+
 	// load all runtimes
 	_ "github.com/nuclio/nuclio/pkg/processor/runtime/dotnetcore"
 	_ "github.com/nuclio/nuclio/pkg/processor/runtime/golang"
@@ -48,6 +52,7 @@ import (
 	_ "github.com/nuclio/nuclio/pkg/processor/runtime/shell"
 	"github.com/nuclio/nuclio/pkg/processor/status"
 	"github.com/nuclio/nuclio/pkg/processor/trigger"
+
 	// load all triggers
 	_ "github.com/nuclio/nuclio/pkg/processor/trigger/cron"
 	_ "github.com/nuclio/nuclio/pkg/processor/trigger/http"
@@ -60,6 +65,7 @@ import (
 	_ "github.com/nuclio/nuclio/pkg/processor/trigger/partitioned/v3io"
 	_ "github.com/nuclio/nuclio/pkg/processor/trigger/poller/v3ioitempoller"
 	_ "github.com/nuclio/nuclio/pkg/processor/trigger/rabbitmq"
+	_ "github.com/nuclio/nuclio/pkg/processor/trigger/zmq"
 	"github.com/nuclio/nuclio/pkg/processor/webadmin"
 	"github.com/nuclio/nuclio/pkg/processor/worker"
 
