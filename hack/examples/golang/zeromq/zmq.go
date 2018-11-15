@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //
-// Listens to a RabbitMQ queue and records any messages posted to a given queue.
+// Listens to a ZMQ and records any messages posted to a given queue.
 // Can retrieve these recorded messages through HTTP GET, demonstrating how a single
 // function can be invoked from different triggers.
 //
