@@ -21,10 +21,12 @@ FROM golang:1.10 as processor
 WORKDIR /go/src/github.com/nuclio/nuclio
 COPY . .
 
+RUN apt-get update && apt-get install libsodium-dev libzmq3-dev -y
 RUN go get github.com/v3io/v3io-go-http \
     && go get github.com/nuclio/logger \
     && go get github.com/nuclio/nuclio-sdk-go \
-    && go get github.com/nuclio/amqp
+    && go get github.com/nuclio/amqp \
+    && go get github.com/pebbe/zmq4
 
 # Create
 RUN mkdir -p /etc/nuclio
@@ -32,7 +34,7 @@ RUN mkdir -p /opt/nuclio
 
 # Make the processor binary
 RUN mkdir -p /home/nuclio/bin \
-    && GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -ldflags="-s -w" -o /home/nuclio/bin/processor cmd/processor/main.go \
+    && GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -a -installsuffix cgo -ldflags="-s -w" -o /home/nuclio/bin/processor cmd/processor/main.go \
     && rm -rf /go/src/github/nuclio/nuclio
 
 FROM golang:1.10
@@ -51,6 +53,7 @@ COPY --from=processor /go/src/github.com/v3io/v3io-go-http /go/src/github.com/v3
 COPY --from=processor /go/src/github.com/nuclio/logger /go/src/github.com/nuclio/logger
 COPY --from=processor /go/src/github.com/nuclio/nuclio-sdk-go /go/src/github.com/nuclio/nuclio-sdk-go
 COPY --from=processor /go/src/github.com/nuclio/amqp /go/src/github.com/nuclio/amqp
+COPY --from=processor /go/src/github.com/pebbe/zmq4 /go/src/github.com/pebbe/zmq4
 
 # This script builds the processor
 COPY pkg/processor/build/runtime/golang/docker/onbuild/build-handler.sh /
