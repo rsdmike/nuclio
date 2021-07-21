@@ -18,14 +18,17 @@ package abstract
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 
+	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/platform"
 
 	"github.com/nuclio/errors"
 	"github.com/nuclio/logger"
+	"github.com/nuclio/nuclio-sdk-go"
 )
 
 type invoker struct {
@@ -43,49 +46,27 @@ func newInvoker(parentLogger logger.Logger, platform platform.Platform) (*invoke
 	return newinvoker, nil
 }
 
-func (i *invoker) invoke(createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) (*platform.CreateFunctionInvocationResult, error) {
-	var invokeURL string
+func (i *invoker) invoke(function platform.Function,
+	createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) (
+
+	*platform.CreateFunctionInvocationResult, error) {
 
 	// save options
 	i.createFunctionInvocationOptions = createFunctionInvocationOptions
 
-	// get the function by name
-	functions, err := i.platform.GetFunctions(&platform.GetFunctionsOptions{
-		Name:      createFunctionInvocationOptions.Name,
-		Namespace: createFunctionInvocationOptions.Namespace,
-	})
-
+	invokeURL, err := i.resolveInvokeURL(function, createFunctionInvocationOptions)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed to get functions")
+		return nil, errors.Wrap(err, "Failed to resolve invocation url")
 	}
 
-	if len(functions) == 0 {
-		return nil, errors.Errorf("Function not found: %s @ %s",
-			createFunctionInvocationOptions.Name,
-			createFunctionInvocationOptions.Namespace)
-	}
-
-	// use the first function found (should always be one, but if there's more just use first)
-	function := functions[0]
-
-	// make sure to initialize the function (some underlying functions are lazy load)
-	if err = function.Initialize(nil); err != nil {
-		return nil, errors.Wrap(err, "Failed to initialize function")
-	}
-
-	// get where the function resides
-	invokeURL, err = function.GetInvokeURL(createFunctionInvocationOptions.Via)
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to get invoke URL")
-	}
-
-	fullpath := "http://" + invokeURL
-
+	fullpath := fmt.Sprintf("http://%s", invokeURL)
 	if createFunctionInvocationOptions.Path != "" {
 		fullpath += "/" + createFunctionInvocationOptions.Path
 	}
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: createFunctionInvocationOptions.Timeout,
+	}
 	var req *http.Request
 	var body io.Reader = http.NoBody
 
@@ -134,4 +115,24 @@ func (i *invoker) invoke(createFunctionInvocationOptions *platform.CreateFunctio
 		Body:       responseBody,
 		StatusCode: response.StatusCode,
 	}, nil
+}
+
+func (i *invoker) resolveInvokeURL(function platform.Function,
+	createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) (string, error) {
+	if createFunctionInvocationOptions.URL != "" {
+
+		// validate given url, must matching one of the function status invocation urls
+		if !common.StringSliceContainsString(function.GetStatus().InvocationURLs(),
+			createFunctionInvocationOptions.URL) {
+			i.logger.WarnWith("Invocation URL does not match any of function status invocation urls",
+				"url", createFunctionInvocationOptions.URL,
+				"invocationURLs", function.GetStatus().InvocationURLs())
+			return "", nuclio.NewErrBadRequest(fmt.Sprintf("Invalid function url %s",
+				createFunctionInvocationOptions.URL))
+		}
+		return createFunctionInvocationOptions.URL, nil
+	}
+
+	// get where the function resides
+	return function.GetInvokeURL(createFunctionInvocationOptions.Via)
 }

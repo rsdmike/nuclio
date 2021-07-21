@@ -17,12 +17,18 @@ limitations under the License.
 package common
 
 import (
+	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/nuclio/errors"
+	"github.com/nuclio/nuclio-sdk-go"
 	"github.com/valyala/fasthttp"
 )
 
@@ -106,4 +112,70 @@ func NormalizeURLPath(p string) string {
 	}
 
 	return string(res)
+}
+
+// SendHTTPRequest Sends an http request
+// ignore expectedStatusCode by setting it to 0
+func SendHTTPRequest(method string,
+	requestURL string,
+	body []byte,
+	headers map[string]string,
+	cookies []*http.Cookie,
+	expectedStatusCode int,
+	insecure bool,
+	timeout time.Duration) ([]byte, *http.Response, error) {
+
+	// create client
+	client := &http.Client{
+		Timeout: timeout,
+	}
+
+	if insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
+	// create request object
+	req, err := http.NewRequest(method, requestURL, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Failed to create http request")
+	}
+
+	// attach cookies
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	// attach headers
+	for headerKey, headerValue := range headers {
+		req.Header.Set(headerKey, headerValue)
+	}
+
+	// perform the request
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Failed to send HTTP request")
+	}
+
+	// read response body
+	var responseBody []byte
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close() // nolint: errcheck
+
+		responseBody, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "Failed to read response body")
+		}
+	}
+
+	// validate status code is as expected
+	if expectedStatusCode != 0 && resp.StatusCode != expectedStatusCode {
+		return responseBody, resp, nuclio.GetByStatusCode(resp.StatusCode)(fmt.Sprintf(
+			"Got unexpected response status code: %d. Expected: %d",
+			resp.StatusCode,
+			expectedStatusCode))
+	}
+
+	return responseBody, resp, nil
 }

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"github.com/nuclio/nuclio/pkg/dashboard/auth"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 
@@ -29,8 +30,11 @@ type CreateDashboardServerOptions struct {
 	templatesGitUsername             string
 	templatesGitPassword             string
 	templatesGithubAccessToken       string
-	defaultHTTPIngressHostTemplate   string
+	templatesGitCaCertContents       string
 	imageNamePrefixTemplate          string
 	platformAuthorizationMode        string
 	dependantImageRegistryURL        string
+
+	// auth options
+	authConfig *auth.Config
 }

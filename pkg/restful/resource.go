@@ -22,11 +22,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/registry"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/nuclio/errors"
 	"github.com/nuclio/logger"
 	"github.com/nuclio/nuclio-sdk-go"
@@ -46,14 +47,28 @@ type CustomRouteFuncResponse struct {
 	StatusCode int
 }
 
+// CustomRouteFuncStreamResponse is what CustomRouteFuncStream returns
+type CustomRouteFuncStreamResponse struct {
+	Headers       map[string]string
+	StatusCode    int
+	ForceFlush    bool
+	FlushInternal time.Duration
+	ReadCloser    io.ReadCloser
+}
+
 // CustomRouteFunc is a handler function for a custom route
 type CustomRouteFunc func(*http.Request) (*CustomRouteFuncResponse, error)
 
+// CustomRouteFuncStream is a handler function for a custom route server stream response
+type CustomRouteFuncStream func(*http.Request) (*CustomRouteFuncStreamResponse, error)
+
 // CustomRoute is a custom route definition
 type CustomRoute struct {
-	Pattern   string
-	Method    string
-	RouteFunc CustomRouteFunc
+	Stream          bool
+	Pattern         string
+	Method          string
+	RouteFunc       CustomRouteFunc
+	StreamRouteFunc CustomRouteFuncStream
 }
 
 // Resource interface
@@ -62,25 +77,28 @@ type Resource interface {
 	// Initialize the concrete server
 	Initialize(logger.Logger, Server) (chi.Router, error)
 
-	// Called after initialization
+	// ExtendMiddlewares extends router middlewares
+	ExtendMiddlewares() error
+
+	// OnAfterInitialize Called after initialization
 	OnAfterInitialize() error
 
-	// returns a list of custom routes for the resource
+	// GetCustomRoutes returns a list of custom routes for the resource
 	GetCustomRoutes() ([]CustomRoute, error)
 
-	// return all instances for resources with multiple instances
+	// GetAll return all instances for resources with multiple instances
 	GetAll(request *http.Request) (map[string]Attributes, error)
 
-	// return specific instance by ID
+	// GetByID return specific instance by ID
 	GetByID(request *http.Request, id string) (Attributes, error)
 
-	// returns resource ID, attributes
+	// Create returns resource ID, attributes
 	Create(request *http.Request) (string, Attributes, error)
 
-	// returns attributes (optionally)
+	// Update returns attributes (optionally)
 	Update(request *http.Request, id string) (Attributes, error)
 
-	// delete an entity
+	// Delete delete an entity
 	Delete(request *http.Request, id string) error
 }
 
@@ -103,10 +121,11 @@ const (
 
 // AbstractResource is base for resources
 type AbstractResource struct {
+	Logger   logger.Logger
+	Resource Resource
+
 	name            string
-	Logger          logger.Logger
 	router          chi.Router
-	Resource        Resource
 	resourceMethods []ResourceMethod
 	server          Server
 	encoderFactory  EncoderFactory
@@ -128,6 +147,12 @@ func (ar *AbstractResource) Initialize(parentLogger logger.Logger, server Server
 	ar.server = server
 	ar.router = chi.NewRouter()
 
+	// extend specific resource middlewares
+	// must occur before route is being registered
+	if err := ar.Resource.ExtendMiddlewares(); err != nil {
+		return nil, errors.Wrap(err, "ExtendMiddlewares returned error")
+	}
+
 	// register routes based on supported methods
 	if err := ar.registerRoutes(); err != nil {
 		return nil, errors.Wrap(err, "Failed to register routes")
@@ -143,6 +168,11 @@ func (ar *AbstractResource) Initialize(parentLogger logger.Logger, server Server
 // Register registers a registry
 func (ar *AbstractResource) Register(registry *registry.Registry) {
 	registry.Register(ar.name, ar)
+}
+
+// GetName returns the resource name
+func (ar *AbstractResource) GetName() string {
+	return ar.name
 }
 
 // GetServer returns the server
@@ -190,6 +220,11 @@ func (ar *AbstractResource) GetRouter() chi.Router {
 	return ar.router
 }
 
+// ExtendMiddlewares extends specific resource middlewares
+func (ar *AbstractResource) ExtendMiddlewares() error {
+	return nil
+}
+
 func (ar *AbstractResource) parseURLParamValue(paramValue string) interface{} {
 	parsedBool, err := strconv.ParseBool(paramValue)
 	if err == nil {
@@ -206,7 +241,7 @@ func (ar *AbstractResource) parseURLParamValue(paramValue string) interface{} {
 		return parsedUint
 	}
 
-	parsedFloat, err := strconv.ParseFloat(paramValue, 10)
+	parsedFloat, err := strconv.ParseFloat(paramValue, 64)
 	if err == nil {
 		return parsedFloat
 	}
@@ -282,6 +317,11 @@ func (ar *AbstractResource) GetURLParamStringOrDefault(request *http.Request, pa
 	return stringParam
 }
 
+// GetRouterURLParam returns the router parameters values by key. e.g.: `/endpoint/{id} -> "value of id"
+func (ar *AbstractResource) GetRouterURLParam(request *http.Request, paramKey string) string {
+	return chi.URLParam(request, paramKey)
+}
+
 func (ar *AbstractResource) registerRoutes() error {
 	for _, resourceMethod := range ar.resourceMethods {
 		switch resourceMethod {
@@ -327,14 +367,21 @@ func (ar *AbstractResource) registerCustomRoutes() error {
 		}
 
 		customRouteCopy := customRoute
-
 		ar.Logger.DebugWith("Registered custom route",
+			"routeName", ar.name,
+			"stream", customRoute.Stream,
 			"pattern", customRoute.Pattern,
 			"method", customRoute.Method)
 
-		routerFunc(customRoute.Pattern, func(responseWriter http.ResponseWriter, request *http.Request) {
-			ar.callCustomRouteFunc(responseWriter, request, customRouteCopy.RouteFunc)
-		})
+		if customRoute.Stream {
+			routerFunc(customRoute.Pattern, func(responseWriter http.ResponseWriter, request *http.Request) {
+				ar.callCustomStreamRouteFunc(responseWriter, request, customRouteCopy.StreamRouteFunc)
+			})
+		} else {
+			routerFunc(customRoute.Pattern, func(responseWriter http.ResponseWriter, request *http.Request) {
+				ar.callCustomRouteFunc(responseWriter, request, customRouteCopy.RouteFunc)
+			})
+		}
 	}
 
 	return nil
@@ -361,7 +408,7 @@ func (ar *AbstractResource) handleGetDetails(responseWriter http.ResponseWriter,
 	encoder := ar.encoderFactory.NewEncoder(responseWriter, ar.name)
 
 	// registered as "/:id/"
-	resourceID := chi.URLParam(request, "id")
+	resourceID := ar.GetRouterURLParam(request, "id")
 
 	// delegate to child
 	attributes, err := ar.Resource.GetByID(request, resourceID)
@@ -407,7 +454,7 @@ func (ar *AbstractResource) handleUpdate(responseWriter http.ResponseWriter, req
 	encoder := ar.encoderFactory.NewEncoder(responseWriter, ar.name)
 
 	// registered as "/:id/"
-	resourceID := chi.URLParam(request, "id")
+	resourceID := ar.GetRouterURLParam(request, "id")
 
 	// delegate to child
 	attributes, err := ar.Resource.Update(request, resourceID)
@@ -428,13 +475,77 @@ func (ar *AbstractResource) handleUpdate(responseWriter http.ResponseWriter, req
 func (ar *AbstractResource) handleDelete(responseWriter http.ResponseWriter, request *http.Request) {
 
 	// registered as "/:id/"
-	resourceID := chi.URLParam(request, "id")
+	resourceID := ar.GetRouterURLParam(request, "id")
 
 	// delegate to child
 	err := ar.Resource.Delete(request, resourceID)
 
 	// get the status code from the error
 	ar.writeStatusCodeAndErrorReason(responseWriter, err, http.StatusNoContent)
+}
+
+func (ar *AbstractResource) callCustomStreamRouteFunc(responseWriter http.ResponseWriter,
+	request *http.Request,
+	routeFunc CustomRouteFuncStream) {
+
+	response, err := routeFunc(request)
+
+	// close at last
+	defer func() {
+		if response != nil && response.ReadCloser != nil {
+			response.ReadCloser.Close()
+		}
+	}()
+
+	if err != nil || response == nil {
+		ar.Logger.WarnWithCtx(request.Context(),
+			"Custom routed handler failed",
+			"response", response)
+		ar.writeStatusCodeAndErrorReason(responseWriter, err, http.StatusInternalServerError)
+		return
+	}
+
+	// set response headers
+	for headerKey, headerValue := range response.Headers {
+		responseWriter.Header().Set(headerKey, headerValue)
+	}
+
+	// set response status code
+	responseWriter.WriteHeader(response.StatusCode)
+
+	// whether to force-ly flush data
+	if response.ForceFlush {
+		if response.FlushInternal == 0 {
+			response.FlushInternal = time.Second
+		}
+
+		// HTTP framework (go-chi package) does not re-flush automatically
+		// This go routine helps out and flushing every <interval> giving the user
+		// the experience of lively-streaming output
+		go func() {
+			defer common.CatchAndLogPanic(request.Context(), // nolint: errcheck
+				ar.Logger,
+				"flush-custom-stream-func")
+
+			for {
+				select {
+				case <-time.After(response.FlushInternal):
+					if flusher, ok := responseWriter.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				case <-request.Context().Done():
+					response.ReadCloser.Close() // nolint: errcheck
+					return
+				}
+			}
+		}()
+	}
+
+	// stream
+	if _, err := io.Copy(responseWriter, response.ReadCloser); err != nil && err != io.EOF {
+		ar.Logger.WarnWithCtx(request.Context(), "Failed to stream", "err", err.Error())
+		responseWriter.Write([]byte(err.Error())) // nolint: errcheck
+	}
 }
 
 func (ar *AbstractResource) callCustomRouteFunc(responseWriter http.ResponseWriter,
@@ -476,14 +587,23 @@ func (ar *AbstractResource) callCustomRouteFunc(responseWriter http.ResponseWrit
 
 	if response.Resources == nil {
 
-		// write a valid, empty JSON
-		if _, err := responseWriter.Write([]byte("{}")); err != nil {
+		switch response.StatusCode {
+		case http.StatusNoContent:
 
-			// should never happen
-			ar.Logger.ErrorWith("Response writer failed writing empty resources",
-				"err", err,
-				"routeFunc", routeFunc,
-				"request", request)
+			// nothing to do
+			break
+		default:
+
+			// write a valid, empty JSON
+			if _, err := responseWriter.Write([]byte("{}")); err != nil {
+
+				// should never happen
+				ar.Logger.ErrorWith("Response writer failed writing empty resources",
+					"err", err,
+					"routeFunc", routeFunc,
+					"request", request)
+			}
+
 		}
 
 		return

@@ -32,8 +32,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nuclio/nuclio/pkg/dashboard"
+	"github.com/nuclio/nuclio/pkg/dashboard/auth"
 	"github.com/nuclio/nuclio/pkg/dashboard/functiontemplates"
 	_ "github.com/nuclio/nuclio/pkg/dashboard/resource"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
@@ -42,8 +44,8 @@ import (
 	mockplatform "github.com/nuclio/nuclio/pkg/platform/mock"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/restful"
-	"github.com/nuclio/nuclio/test/compare"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/nuclio/logger"
 	"github.com/nuclio/nuclio-sdk-go"
 	"github.com/nuclio/zap"
@@ -87,13 +89,14 @@ func (suite *dashboardTestSuite) SetupTest() {
 		templateRepository,
 		&platformconfig.Config{
 			Kube: platformconfig.PlatformKubeConfig{
-				DefaultServiceType: v1.ServiceTypeNodePort,
+				DefaultServiceType:             v1.ServiceTypeNodePort,
+				DefaultHTTPIngressHostTemplate: "{{ .FunctionName }}.{{ .ProjectName }}.{{ .Namespace }}.test.com",
 			},
 		},
 		"",
 		"",
 		"",
-		"")
+		&auth.Config{})
 
 	if err != nil {
 		panic("Failed to create server")
@@ -127,7 +130,7 @@ func (suite *dashboardTestSuite) sendRequest(method string,
 	encodedResponseBody, err := ioutil.ReadAll(response.Body)
 	suite.Require().NoError(err)
 
-	defer response.Body.Close()
+	defer response.Body.Close() // nolint: errcheck
 
 	suite.logger.DebugWith("Got response",
 		"status", response.StatusCode,
@@ -143,7 +146,7 @@ func (suite *dashboardTestSuite) sendRequest(method string,
 
 	if encodedExpectedResponse != nil {
 
-		err = json.Unmarshal(encodedResponseBody, &decodedResponseBody)
+		err := json.Unmarshal(encodedResponseBody, &decodedResponseBody)
 		suite.Require().NoError(err)
 
 		suite.logger.DebugWith("Comparing expected", "expected", encodedExpectedResponse)
@@ -152,10 +155,9 @@ func (suite *dashboardTestSuite) sendRequest(method string,
 		case string:
 			decodedExpectedResponseBody := map[string]interface{}{}
 
-			err = json.Unmarshal([]byte(typedEncodedExpectedResponse), &decodedExpectedResponseBody)
+			err := json.Unmarshal([]byte(typedEncodedExpectedResponse), &decodedExpectedResponseBody)
 			suite.Require().NoError(err)
-
-			suite.Require().True(compare.NoOrder(decodedExpectedResponseBody, decodedResponseBody))
+			suite.Require().Empty(cmp.Diff(decodedExpectedResponseBody, decodedResponseBody))
 
 		case func(response map[string]interface{}) bool:
 			suite.Require().True(typedEncodedExpectedResponse(decodedResponseBody))
@@ -537,6 +539,80 @@ func (suite *functionTestSuite) TestDeleteNoNamespace() {
 	suite.sendRequestNoNamespace("DELETE")
 }
 
+func (suite *functionTestSuite) TestInvokeUnSuccessful() {
+	errMessage := "something-bad-happened"
+	functionName := "f1"
+	functionNamespace := "f1-namespace"
+
+	requestMethod := "PUT"
+	requestPath := "/some/path"
+	requestBody := []byte("request body")
+
+	// headers we want to pass to the actual function
+	functionRequestHeaders := map[string]string{
+		"request_h1": "request_h1v",
+		"request_h2": "request_h2v",
+	}
+
+	// headers we need to pass to dashboard for invocation
+	requestHeaders := map[string]string{
+		"x-nuclio-path":               requestPath,
+		"x-nuclio-function-name":      functionName,
+		"x-nuclio-function-namespace": functionNamespace,
+		"x-nuclio-invoke-url":         "something-bad",
+	}
+
+	// add functionRequestHeaders to requestHeaders so that dashboard will invoke the functions with them
+	for headerKey, headerValue := range functionRequestHeaders {
+		requestHeaders[headerKey] = headerValue
+	}
+
+	// CreateFunctionInvocationResult holds the result of a single invocation
+	expectedInvokeResult := platform.CreateFunctionInvocationResult{}
+
+	// verify call to invoke function
+	verifyCreateFunctionInvocation := func(createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) bool {
+		suite.Require().Equal(functionName, createFunctionInvocationOptions.Name)
+		suite.Require().Equal(functionNamespace, createFunctionInvocationOptions.Namespace)
+		suite.Require().Equal(requestBody, createFunctionInvocationOptions.Body)
+		suite.Require().Equal(requestMethod, createFunctionInvocationOptions.Method)
+		suite.Require().Equal(platform.InvokeViaAny, createFunctionInvocationOptions.Via)
+		suite.Require().Equal("something-bad", createFunctionInvocationOptions.URL)
+
+		// dashboard will trim the first "/"
+		suite.Require().Equal(requestPath[1:], createFunctionInvocationOptions.Path)
+
+		// expect only to receive the function headers (those that don't start with x-nuclio
+		for headerKey := range createFunctionInvocationOptions.Headers {
+			suite.Require().False(strings.HasPrefix(headerKey, "x-nuclio"))
+		}
+
+		// expect all the function headers to be there
+		for headerKey, headerValue := range functionRequestHeaders {
+			suite.Require().Equal(headerValue, createFunctionInvocationOptions.Headers.Get(headerKey))
+		}
+
+		return true
+	}
+
+	suite.mockPlatform.
+		On("CreateFunctionInvocation", mock.MatchedBy(verifyCreateFunctionInvocation)).
+		Return(&expectedInvokeResult, nuclio.NewErrBadRequest(errMessage)).
+		Once()
+
+	expectedStatusCode := http.StatusBadRequest
+	ecv := restful.NewErrorContainsVerifier(suite.logger, []string{errMessage})
+
+	suite.sendRequest(requestMethod,
+		"/api/function_invocations",
+		requestHeaders,
+		bytes.NewBuffer(requestBody),
+		&expectedStatusCode,
+		ecv.Verify)
+
+	suite.mockPlatform.AssertExpectations(suite.T())
+}
+
 func (suite *functionTestSuite) TestInvokeSuccessful() {
 	functionName := "f1"
 	functionNamespace := "f1-namespace"
@@ -558,6 +634,8 @@ func (suite *functionTestSuite) TestInvokeSuccessful() {
 		"x-nuclio-function-name":      functionName,
 		"x-nuclio-function-namespace": functionNamespace,
 		"x-nuclio-invoke-via":         "external-ip",
+		"x-nuclio-invoke-url":         "something",
+		"x-nuclio-invoke-timeout":     "5m",
 	}
 
 	// add functionRequestHeaders to requestHeaders so that dashboard will invoke the functions with them
@@ -582,6 +660,8 @@ func (suite *functionTestSuite) TestInvokeSuccessful() {
 		suite.Require().Equal(requestBody, createFunctionInvocationOptions.Body)
 		suite.Require().Equal(requestMethod, createFunctionInvocationOptions.Method)
 		suite.Require().Equal(platform.InvokeViaAny, createFunctionInvocationOptions.Via)
+		suite.Require().Equal("something", createFunctionInvocationOptions.URL)
+		suite.Require().Equal(5*time.Minute, createFunctionInvocationOptions.Timeout)
 
 		// dashboard will trim the first "/"
 		suite.Require().Equal(requestPath[1:], createFunctionInvocationOptions.Path)
@@ -1586,6 +1666,7 @@ func (suite *projectTestSuite) TestDeleteWithFunctions() {
 		},
 	} {
 		suite.Run(testCase.name, func() {
+			testCase.deleteProjectOptions.AuthSession = &auth.NopSession{}
 			suite.mockPlatform.
 				On("DeleteProject", testCase.deleteProjectOptions).
 				Return(testCase.deleteProjectReturnedError).
@@ -1664,7 +1745,7 @@ func (suite *projectTestSuite) TestImportSuccessful() {
 		suite.Require().Equal("p1-namespace", createAPIGatewayOptions.APIGatewayConfig.Meta.Namespace)
 		suite.Require().Equal("some-host", createAPIGatewayOptions.APIGatewayConfig.Spec.Host)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Kind)
-		suite.Require().Equal("f1", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Nucliofunction.Name)
+		suite.Require().Equal("f1", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name)
 
 		return true
 	}
@@ -1818,7 +1899,7 @@ func (suite *projectTestSuite) TestImportFunctionExistsSuccessful() {
 	apiGateway.APIGatewayConfig.Spec.Upstreams = []platform.APIGatewayUpstreamSpec{
 		{
 			Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-			Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+			NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 				Name: "f1",
 			},
 		},
@@ -1849,7 +1930,7 @@ func (suite *projectTestSuite) TestImportFunctionExistsSuccessful() {
 		suite.Require().Equal("p1-namespace", createAPIGatewayOptions.APIGatewayConfig.Meta.Namespace)
 		suite.Require().Equal("host-name1", createAPIGatewayOptions.APIGatewayConfig.Spec.Host)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Kind)
-		suite.Require().Equal("f1", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Nucliofunction.Name)
+		suite.Require().Equal("f1", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name)
 
 		return true
 	}
@@ -2521,12 +2602,12 @@ func (suite *apiGatewayTestSuite) TestGetDetailSuccessful() {
 				Upstreams: []platform.APIGatewayUpstreamSpec{
 					{
 						Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-						Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+						NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 							Name: "f1",
 						},
 					}, {
 						Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-						Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+						NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 							Name: "f2",
 						},
 						Percentage: 20,
@@ -2632,12 +2713,12 @@ func (suite *apiGatewayTestSuite) TestGetListSuccessful() {
 	returnedAPIGateway1.APIGatewayConfig.Spec.Upstreams = []platform.APIGatewayUpstreamSpec{
 		{
 			Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-			Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+			NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 				Name: "f1",
 			},
 		}, {
 			Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-			Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+			NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 				Name: "f2",
 			},
 			Percentage: 20,
@@ -2662,12 +2743,12 @@ func (suite *apiGatewayTestSuite) TestGetListSuccessful() {
 	returnedAPIGateway2.APIGatewayConfig.Spec.Upstreams = []platform.APIGatewayUpstreamSpec{
 		{
 			Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-			Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+			NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 				Name: "f3",
 			},
 		}, {
 			Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-			Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+			NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 				Name: "f4",
 			},
 			Percentage: 50,
@@ -2792,9 +2873,9 @@ func (suite *apiGatewayTestSuite) TestCreateSuccessful() {
 		suite.Require().Equal("some-desc2", createAPIGatewayOptions.APIGatewayConfig.Spec.Description)
 		suite.Require().Equal("some-path2", createAPIGatewayOptions.APIGatewayConfig.Spec.Path)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Kind)
-		suite.Require().Equal("f3", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Nucliofunction.Name)
+		suite.Require().Equal("f3", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Kind)
-		suite.Require().Equal("f4", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Nucliofunction.Name)
+		suite.Require().Equal("f4", createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].NuclioFunction.Name)
 		suite.Require().Equal(50, createAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Percentage)
 
 		return true
@@ -2857,9 +2938,9 @@ func (suite *apiGatewayTestSuite) TestUpdateSuccessful() {
 		suite.Require().Equal("some-desc2", updateAPIGatewayOptions.APIGatewayConfig.Spec.Description)
 		suite.Require().Equal("some-path2", updateAPIGatewayOptions.APIGatewayConfig.Spec.Path)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Kind)
-		suite.Require().Equal("f3", updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].Nucliofunction.Name)
+		suite.Require().Equal("f3", updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name)
 		suite.Require().Equal(platform.APIGatewayUpstreamKindNuclioFunction, updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Kind)
-		suite.Require().Equal("f4", updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Nucliofunction.Name)
+		suite.Require().Equal("f4", updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].NuclioFunction.Name)
 		suite.Require().Equal(50, updateAPIGatewayOptions.APIGatewayConfig.Spec.Upstreams[1].Percentage)
 
 		return true
@@ -2997,7 +3078,6 @@ func (suite *miscTestSuite) TestGetExternalIPAddresses() {
 
 func (suite *miscTestSuite) TestGetFrontendSpec() {
 	returnedAddresses := []string{"address1", "address2", "address3"}
-	defaultHTTPIngressHostTemplate := "{{ .FunctionName }}.{{ .ProjectName }}.{{ .Namespace }}.test-system.com"
 	imageNamePrefixTemplate := "{{ .ProjectName }}-{{ .FunctionName }}-"
 	scaleToZeroConfiguration := platformconfig.ScaleToZero{
 		Mode:                     platformconfig.EnabledScaleToZeroMode,
@@ -3018,11 +3098,6 @@ func (suite *miscTestSuite) TestGetFrontendSpec() {
 	suite.mockPlatform.
 		On("GetExternalIPAddresses").
 		Return(returnedAddresses, nil).
-		Once()
-
-	suite.mockPlatform.
-		On("GetDefaultHTTPIngressHostTemplate").
-		Return(defaultHTTPIngressHostTemplate, nil).
 		Once()
 
 	suite.mockPlatform.
@@ -3084,7 +3159,7 @@ func (suite *miscTestSuite) TestGetFrontendSpec() {
             }
         }
     },
-    "defaultHTTPIngressHostTemplate": "{{ .FunctionName }}.{{ .ProjectName }}.{{ .Namespace }}.test-system.com",
+    "defaultHTTPIngressHostTemplate": "{{ .FunctionName }}.{{ .ProjectName }}.{{ .Namespace }}.test.com",
     "externalIPAddresses": [
         "address1",
         "address2",
